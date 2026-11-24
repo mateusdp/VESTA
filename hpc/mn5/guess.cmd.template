@@ -1,0 +1,114 @@
+#!/bin/bash
+# =============================================================================
+# guess.cmd.template
+#
+# SLURM batch script template for LPJ-GUESS-NTD production runs on
+# MareNostrum 5 (BSC). Placeholders (PLACEHOLDER_*) are replaced by
+# submit_chelsa_template.sh before submission.
+#
+# This script:
+#   1. Builds a combined .ins file (flattening all imports)
+#   2. Creates NPROCESS run directories
+#   3. Splits the gridlist round-robin across processes (via awk)
+#   4. Splits the soil file across processes (via split)
+#   5. Runs LPJ-GUESS in parallel with mpiexec
+#
+# Output gathering (append + compress) is handled post-job by
+# join_compress.sh or manually.
+#
+# Part of: lpj-guess-ntd-vesta HPC workflow (MareNostrum 5)
+# =============================================================================
+
+#SBATCH -n PLACEHOLDER_NPROCESS
+#SBATCH --time=PLACEHOLDER_WALLTIME
+#SBATCH --cpus-per-task=1
+#SBATCH --error=guess_err.log
+#SBATCH --output=guess_out.log
+#SBATCH --job-name=PLACEHOLDER_RUNNAME
+#SBATCH --partition=PLACEHOLDER_PARTITION
+#SBATCH --account=PLACEHOLDER_ACCOUNT
+#SBATCH --qos=PLACEHOLDER_QOS
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mateus.dantas@senckenberg.de
+
+set -e
+export OMP_NUM_THREADS=1
+export SRUN_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-1}
+
+if ! type -P mpirun &> /dev/null; then
+    echo "Didn't find mpirun! Make sure an MPI module is loaded." >&2
+    exit 1
+fi
+
+# =============================================================================
+# Build combined .ins file
+# =============================================================================
+# LPJ-GUESS .ins files use "import" to include other files. The
+# recursive-ins-compilator.sh script flattens all imports into a single
+# file, which is needed because MPI processes may run from different
+# directories. The soil file path is also patched to a relative path
+# since each run directory gets its own split copy.
+
+echo "Building combined .ins file..."
+echo -n > PLACEHOLDER_COMBINED_INSFILE
+cd PLACEHOLDER_INSDIR
+bash /gpfs/scratch/ehpc336/LPJ_GUESS/scripts/recursive-ins-compilator.sh PLACEHOLDER_INSFILE PLACEHOLDER_COMBINED_INSFILE
+cd $SLURM_SUBMIT_DIR
+
+# Patch soil file path to per-process local copy
+sed -i 's|param "file_soildata".*|param "file_soildata" (str "./soilmap.dat")|' PLACEHOLDER_COMBINED_INSFILE
+echo "Done."
+
+# =============================================================================
+# Setup: create run directories, split inputs
+# =============================================================================
+
+echo "=========================================="
+echo "Setup: PLACEHOLDER_RUNNAME"
+echo "  NPROCESS: PLACEHOLDER_NPROCESS"
+echo "  Gridlist: PLACEHOLDER_GRIDLIST"
+echo "  Soil:     PLACEHOLDER_SOILFILE"
+echo "  Start:    $(date)"
+echo "=========================================="
+
+# Create run directories in parallel
+echo "Creating PLACEHOLDER_NPROCESS run directories..."
+seq 1 PLACEHOLDER_NPROCESS | xargs -P 112 -I{} mkdir -p run{}
+echo "Done."
+
+# Split gridlist round-robin across processes
+# This "deals" cells like a deck of cards, ensuring:
+#   - No process gets an empty gridlist
+#   - High/low productivity cells are distributed evenly
+#   - Each process takes approximately the same wall time
+echo "Splitting gridlist..."
+awk -v nproc="PLACEHOLDER_NPROCESS" -v fname="PLACEHOLDER_GRIDLIST_FILENAME" '{
+    proc = ((NR - 1) % nproc) + 1
+    print $0 >> ("run" proc "/" fname)
+}' "PLACEHOLDER_GRIDLIST"
+echo "Gridlist split complete."
+
+# Split soil file across processes
+# Each process gets the header + its share of data rows.
+# split -n r/N does round-robin distribution of lines.
+echo "Splitting soil file..."
+SOIL_HEADER=$(head -1 "PLACEHOLDER_SOILFILE")
+seq 1 PLACEHOLDER_NPROCESS | xargs -P 112 -I{} sh -c "echo '$SOIL_HEADER' > run{}/soilmap.dat"
+tail -n +2 "PLACEHOLDER_SOILFILE" | split -n r/PLACEHOLDER_NPROCESS -d -a 5 - soil_chunk_
+seq 0 $((PLACEHOLDER_NPROCESS - 1)) | xargs -P 112 -I{} sh -c 'i={}; run=$((i+1)); cat soil_chunk_$(printf "%05d" $i) >> run${run}/soilmap.dat; rm soil_chunk_$(printf "%05d" $i)'
+echo "Soil split complete."
+
+# =============================================================================
+# Run LPJ-GUESS
+# =============================================================================
+
+echo ""
+echo "Starting LPJ-GUESS-NTD at $(date)"
+echo ""
+
+mpiexec PLACEHOLDER_GUESS_BIN -parallel -input PLACEHOLDER_INPUT_MODULE PLACEHOLDER_COMBINED_INSFILE
+
+echo ""
+echo "=========================================="
+echo "LPJ-GUESS finished at $(date)"
+echo "=========================================="
